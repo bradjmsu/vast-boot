@@ -163,6 +163,16 @@ def read_activity() -> tuple[float | None, float]:
     return running + waiting, running
 
 
+# The destroy path is the money-safety backstop and MUST NOT depend on the
+# on-box networking extras. On-box worker mode (issue #1249) exports
+# ALL_PROXY/HTTP_PROXY/HTTPS_PROXY pointing at the unsupervised userspace
+# tailscaled so the Prefect client can reach hermes; if urllib honoured those,
+# a dead tailscaled would route the console.vast.ai destroy call into a black
+# hole and the box would burn forever. This opener has an empty ProxyHandler, so
+# every vast API call goes direct regardless of the proxy env vars.
+_VAST_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def destroy_once() -> bool:
     """Call the vast.ai destroy API once. Returns True on a 2xx response."""
     url = f"https://console.vast.ai/api/v0/instances/{VAST_INSTANCE_ID}/"
@@ -176,7 +186,7 @@ def destroy_once() -> bool:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _VAST_API_OPENER.open(req, timeout=10) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             LOG.info("destroy call responded status=%s body=%s", resp.status, body)
             return 200 <= resp.status < 300
@@ -280,7 +290,7 @@ class WorkerSupervisor:
     result loss)."""
 
     def __init__(self) -> None:
-        self.procs: list[subprocess.Popen] = []
+        self.procs: list[subprocess.Popen | None] = []
         self._specs: list[tuple[str, str]] = []  # (pool, worker_name)
 
     def _mount_live(self) -> bool:
@@ -291,7 +301,7 @@ class WorkerSupervisor:
         except OSError:
             return False
 
-    def _spawn(self, pool: str, name: str) -> subprocess.Popen:
+    def _spawn(self, pool: str, name: str) -> subprocess.Popen | None:
         cmd = [
             "prefect", "worker", "start",
             "--pool", pool,
@@ -302,7 +312,14 @@ class WorkerSupervisor:
         LOG.info(
             "starting on-box worker pool=%s name=%s limit=%s", pool, name, ONBOX_WORKER_LIMIT
         )
-        return subprocess.Popen(cmd, cwd=ONBOX_FLOWS_DIR)  # noqa: S603 - trusted argv
+        try:
+            return subprocess.Popen(cmd, cwd=ONBOX_FLOWS_DIR)  # noqa: S603 - trusted argv
+        except Exception as exc:  # noqa: BLE001 - a spawn failure (e.g. prefect not
+            # on PATH, or the flows dir missing) must NEVER kill the watchdog; that
+            # would drop vLLM destroy supervision and risk a burning box. Log and
+            # treat it as a dead worker: check_and_restart retries next tick.
+            LOG.error("failed to spawn on-box worker %s (pool=%s): %s", name, pool, exc)
+            return None
 
     def start(self) -> bool:
         """Start the configured workers. Starts nothing and returns False if
@@ -328,20 +345,23 @@ class WorkerSupervisor:
         return True
 
     def check_and_restart(self) -> None:
-        """Restart any worker that exited. Never destroys the box."""
+        """Restart any worker that exited or failed to spawn. Never destroys the
+        box and never propagates (a restart failure is logged and retried next
+        tick)."""
         for idx, proc in enumerate(self.procs):
-            if proc.poll() is None:
+            if proc is not None and proc.poll() is None:
                 continue
             pool, name = self._specs[idx]
-            LOG.warning(
-                "on-box worker %s (pool=%s) exited rc=%s; restarting",
-                name, pool, proc.returncode,
-            )
+            if proc is not None:
+                LOG.warning(
+                    "on-box worker %s (pool=%s) exited rc=%s; restarting",
+                    name, pool, proc.returncode,
+                )
             self.procs[idx] = self._spawn(pool, name)
 
     def terminate(self) -> None:
         for proc in self.procs:
-            if proc.poll() is None:
+            if proc is not None and proc.poll() is None:
                 try:
                     proc.terminate()
                 except Exception as exc:  # noqa: BLE001 - best-effort shutdown
