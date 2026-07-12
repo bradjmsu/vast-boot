@@ -20,6 +20,14 @@ kill the watchdog before it could destroy the instance. Supervising vLLM as a
 child process
 fixes that.
 
+On-box worker mode (issue #1249): when LAZIO_VAST_ONBOX=1, after vLLM is healthy
+this process also supervises WORKER_COUNT Prefect process workers so the rented
+box drains its own queue instead of hermes's 8 vCPUs starving the GPU. A worker
+dying is NOT a money-safety event (the box is still serving inference), so a
+dead worker is restarted and never triggers a destroy; only vLLM death destroys.
+Workers start only if the shared Prefect result mount is live, so a half-set-up
+box never persists results the hermes-side caller cannot read.
+
 Standard library only (subprocess, urllib, os, sys, time, json, logging) so this
 file has no extra pip install and cannot be broken by a dependency drifting
 under it.
@@ -71,6 +79,18 @@ DESTROY_MAX_ATTEMPTS = 5
 DESTROY_INITIAL_BACKOFF_SECONDS = 5
 
 DESTROY_ENABLED = bool(VAST_INSTANCE_ID and VAST_DESTROY_KEY)
+
+# On-box worker mode (issue #1249): when LAZIO_VAST_ONBOX=1 this box also runs
+# Prefect process workers, started AFTER vLLM is healthy and ONLY if the shared
+# result mount is live. A worker dying is not a money-safety event (the box is
+# still serving inference), so workers are restarted and never trigger a destroy;
+# only vLLM death destroys. Env is injected by routes/llm_backends._burst_onbox_env.
+ONBOX_ENABLED = os.environ.get("LAZIO_VAST_ONBOX", "0").strip() == "1"
+ONBOX_WORKER_COUNT = int(os.environ.get("WORKER_COUNT", "0") or "0")
+ONBOX_POOLS = [p for p in os.environ.get("LAZIO_PREFECT_ONBOX_POOLS", "").split() if p]
+ONBOX_WORKER_LIMIT = int(os.environ.get("LAZIO_PREFECT_VAST_ONBOX_LIMIT", "8") or "8")
+ONBOX_RESULTS_PATH = os.environ.get("PREFECT_LOCAL_STORAGE_PATH", "").strip()
+ONBOX_FLOWS_DIR = os.environ.get("LAZIO_ONBOX_FLOWS_DIR", "/opt/prefect/flows")
 
 
 def check_health() -> bool:
@@ -248,11 +268,95 @@ class VllmSupervisor:
                 LOG.warning("terminating vLLM failed: %s", exc)
 
 
-def destroy_and_exit(sup: VllmSupervisor, reason: str) -> None:
+class WorkerSupervisor:
+    """Owns the on-box Prefect worker subprocesses (issue #1249).
+
+    Unlike the vLLM child, a worker dying is NOT a money-safety event: the box is
+    still serving inference, so a dead worker is simply restarted and never
+    triggers a destroy. Workers start only after vLLM is healthy AND the shared
+    result mount is confirmed live, because a worker that ran backend_call
+    without the mount would persist results to the box's own disk where the
+    hermes-side parent that called run_deployment could never read them (silent
+    result loss)."""
+
+    def __init__(self) -> None:
+        self.procs: list[subprocess.Popen] = []
+        self._specs: list[tuple[str, str]] = []  # (pool, worker_name)
+
+    def _mount_live(self) -> bool:
+        if not ONBOX_RESULTS_PATH:
+            return False
+        try:
+            return os.path.ismount(ONBOX_RESULTS_PATH)
+        except OSError:
+            return False
+
+    def _spawn(self, pool: str, name: str) -> subprocess.Popen:
+        cmd = [
+            "prefect", "worker", "start",
+            "--pool", pool,
+            "--type", "process",
+            "--name", name,
+            "--limit", str(ONBOX_WORKER_LIMIT),
+        ]
+        LOG.info(
+            "starting on-box worker pool=%s name=%s limit=%s", pool, name, ONBOX_WORKER_LIMIT
+        )
+        return subprocess.Popen(cmd, cwd=ONBOX_FLOWS_DIR)  # noqa: S603 - trusted argv
+
+    def start(self) -> bool:
+        """Start the configured workers. Starts nothing and returns False if
+        on-box mode is off/misconfigured or the result mount is not live."""
+        if not (ONBOX_ENABLED and ONBOX_WORKER_COUNT > 0 and ONBOX_POOLS):
+            LOG.info("on-box worker mode not armed; running vLLM-only")
+            return False
+        if not self._mount_live():
+            LOG.error(
+                "on-box mode is on but the shared result mount %s is NOT live; "
+                "refusing to start workers (their results would be unreadable by "
+                "hermes). Box keeps serving vLLM on its public URL.",
+                ONBOX_RESULTS_PATH or "<unset>",
+            )
+            return False
+        cid = os.environ.get("CONTAINER_ID", "box")
+        for i in range(ONBOX_WORKER_COUNT):
+            pool = ONBOX_POOLS[i % len(ONBOX_POOLS)]
+            name = f"vast-{cid}-{pool}-{i}"
+            self._specs.append((pool, name))
+            self.procs.append(self._spawn(pool, name))
+        LOG.info("started %s on-box worker(s) across pools %s", len(self.procs), ONBOX_POOLS)
+        return True
+
+    def check_and_restart(self) -> None:
+        """Restart any worker that exited. Never destroys the box."""
+        for idx, proc in enumerate(self.procs):
+            if proc.poll() is None:
+                continue
+            pool, name = self._specs[idx]
+            LOG.warning(
+                "on-box worker %s (pool=%s) exited rc=%s; restarting",
+                name, pool, proc.returncode,
+            )
+            self.procs[idx] = self._spawn(pool, name)
+
+    def terminate(self) -> None:
+        for proc in self.procs:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception as exc:  # noqa: BLE001 - best-effort shutdown
+                    LOG.warning("terminating on-box worker failed: %s", exc)
+
+
+def destroy_and_exit(
+    sup: VllmSupervisor, reason: str, workers: WorkerSupervisor | None = None
+) -> None:
     """Tear the vLLM child down, destroy this instance (retrying until it dies),
     then exit. If self-destruct is disabled, exit anyway after logging loudly;
     exiting does not stop the box (not PID 1), so the hermes-side compute
     steward is the remaining backstop in that mode."""
+    if workers is not None:
+        workers.terminate()
     sup.terminate()
     while not request_destroy(reason):
         if not DESTROY_ENABLED:
@@ -317,6 +421,12 @@ def main() -> None:
             "box that never serves is pure waste",
         )
 
+    # On-box workers start only now that vLLM is healthy. A failure to start (or
+    # a dead result mount) leaves the box serving vLLM on its public URL; it is
+    # never a destroy condition.
+    workers = WorkerSupervisor()
+    workers.start()
+
     now = time.time()
     boot_time = now
     last_activity_time = now
@@ -331,7 +441,7 @@ def main() -> None:
         state = sup.check()
         if state == "dead":
             destroy_and_exit(
-                sup, "vLLM died after health and exhausted its restart budget"
+                sup, "vLLM died after health and exhausted its restart budget", workers
             )
         if state == "restarted":
             # A restart re-enters warmup; reset the idle clock so we do not
@@ -339,6 +449,10 @@ def main() -> None:
             last_activity_time = time.time()
             last_activity_value = None
             continue
+
+        # 2) Keep the on-box workers alive. Worker death is not a money-safety
+        #    event, so restart them without ever destroying the box.
+        workers.check_and_restart()
 
         now = time.time()
         try:
@@ -362,12 +476,12 @@ def main() -> None:
 
         if idle_minutes >= IDLE_MINUTES:
             destroy_and_exit(
-                sup, f"idle for {idle_minutes:.1f} minutes (limit {IDLE_MINUTES})"
+                sup, f"idle for {idle_minutes:.1f} minutes (limit {IDLE_MINUTES})", workers
             )
 
         if uptime_hours >= TTL_HOURS:
             destroy_and_exit(
-                sup, f"TTL reached: {uptime_hours:.1f} hours alive (limit {TTL_HOURS})"
+                sup, f"TTL reached: {uptime_hours:.1f} hours alive (limit {TTL_HOURS})", workers
             )
 
 
