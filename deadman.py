@@ -2,7 +2,8 @@
 """Dead-man watchdog + supervisor for a vast.ai vLLM rental.
 
 Money-safety purpose: a forgotten or wedged GPU rental burns cash forever if
-nothing ever turns it off. This process is PID 1 in the container and SUPERVISES
+nothing ever turns it off. This process runs under vast.ai's onstart launcher
+(NOT as container PID 1) and SUPERVISES
 vLLM: it spawns the server as a child (the serve command is passed as argv),
 monitors it, and destroys ITS OWN vast.ai instance the moment any of these is
 true:
@@ -14,9 +15,9 @@ true:
   - the instance has been alive past TTL_HOURS, regardless of activity, as a
     hard backstop against a runaway "always busy" rental nobody asked for
 
-Running vLLM as PID 1 with the watchdog backgrounded would be unsafe: a vLLM
-crash would exit PID 1, tear down the container namespace, and kill the watchdog
-with it, leaving the rental stopped but still charged. Supervising from PID 1
+Backgrounding the watchdog behind vLLM would be unsafe: a vLLM crash would
+kill the watchdog before it could destroy the instance. Supervising vLLM as a
+child process
 fixes that.
 
 Standard library only (subprocess, urllib, os, sys, time, json, logging) so this
@@ -24,9 +25,10 @@ file has no extra pip install and cannot be broken by a dependency drifting
 under it.
 
 If VAST_INSTANCE_ID or VAST_DESTROY_KEY is missing, self-destruct is disabled
-but the watchdog still runs and logs exactly what it WOULD have done; when it
-would have destroyed, it exits so the container stops rather than billing a dead
-box forever.
+but the watchdog still runs and logs exactly what it WOULD have done. NOTE:
+because this process is not container PID 1, exiting does NOT stop the box or
+its billing; with self-destruct disabled the only backstops are the hermes-side
+compute steward (never-healthy / TTL / unproductive destroys) and the operator.
 """
 
 from __future__ import annotations
@@ -248,14 +250,15 @@ class VllmSupervisor:
 
 def destroy_and_exit(sup: VllmSupervisor, reason: str) -> None:
     """Tear the vLLM child down, destroy this instance (retrying until it dies),
-    then stop the container. If self-destruct is disabled, exit so the container
-    stops rather than billing a dead box forever."""
+    then exit. If self-destruct is disabled, exit anyway after logging loudly;
+    exiting does not stop the box (not PID 1), so the hermes-side compute
+    steward is the remaining backstop in that mode."""
     sup.terminate()
     while not request_destroy(reason):
         if not DESTROY_ENABLED:
             LOG.error(
-                "self-destruct is DISABLED and this box is being torn down; "
-                "exiting so the container stops"
+                "self-destruct is DISABLED; exiting. NOTE this does not stop "
+                "the box (not PID 1); the compute steward must reap it"
             )
             sys.exit(1)
         time.sleep(POLL_SECONDS)
