@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "image": "vllm/vllm-openai@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb",
+  "models": {
+    "production": {
+      "repo": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "revision": "95a723d08a9490559dae23d0cff1d9466213d989",
+      "served_model_name": "qwen"
+    },
+    "test_3090_tiny": {
+      "repo": "Qwen/Qwen3-0.6B",
+      "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+      "served_model_name": "qwen"
+    }
+  }
+}

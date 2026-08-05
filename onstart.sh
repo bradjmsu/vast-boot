@@ -17,6 +17,7 @@ python3 -c 'import hf_transfer' 2>/dev/null || \
     pip install --no-cache-dir --break-system-packages hf_transfer
 
 MODEL_REPO="${VLLM_HF_MODEL:-Qwen/Qwen3.6-35B-A3B-FP8}"
+MODEL_REVISION="${VLLM_HF_REVISION:?VLLM_HF_REVISION is required}"
 MODEL_PATH="${VLLM_MODEL_PATH:-/models/qwen}"
 HF_CLI="$(command -v hf || command -v huggingface-cli)"
 if [[ -z "${HF_CLI}" ]]; then
@@ -25,7 +26,7 @@ if [[ -z "${HF_CLI}" ]]; then
 fi
 
 mkdir -p "${MODEL_PATH}"
-"${HF_CLI}" download "${MODEL_REPO}" --local-dir "${MODEL_PATH}"
+"${HF_CLI}" download "${MODEL_REPO}" --revision "${MODEL_REVISION}" --local-dir "${MODEL_PATH}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
