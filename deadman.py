@@ -31,8 +31,7 @@ provision env passes a non-numeric value (e.g. $CONTAINER_ID, issue #3712), the
 watchdog attempts to discover the numeric id from the vast API at startup and
 logs CRITICAL if it cannot. NOTE: because this process is not container PID 1,
 exiting does NOT stop the box or its billing; with self-destruct disabled the
-only backstops are the hermes-side compute steward (never-healthy / TTL /
-unproductive destroys) and the operator.
+only backstops are the production compute steward and the operator.
 """
 
 from __future__ import annotations
@@ -89,8 +88,8 @@ def _my_public_ip(timeout: float = 5.0) -> str | None:
     """Best-effort public IPv4 of this box. Used to identify ourselves in the
     vast fleet list when CONTAINER_ID is not exposed by the API.
 
-    Uses a no-proxy opener so on-box worker mode's tailscaled proxy cannot
-    return the proxy's IP instead of this box's public IP.
+    Uses a no-proxy opener so inherited proxy settings cannot return a proxy's
+    IP instead of this box's public IP.
     """
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     for url in (
@@ -216,15 +215,6 @@ def _get_instance_id() -> str | None:
         _RESOLVED_INSTANCE_ID = _resolve_instance_id()
     return _RESOLVED_INSTANCE_ID
 
-# Rented GPU boxes are inference-only. These constants remain only so old
-# watchdog code cannot be accidentally re-enabled by a stale environment.
-ONBOX_ENABLED = False
-ONBOX_WORKER_COUNT = int(os.environ.get("WORKER_COUNT", "0") or "0")
-ONBOX_POOLS = [p for p in os.environ.get("LAZIO_PREFECT_ONBOX_POOLS", "").split() if p]
-ONBOX_WORKER_LIMIT = int(os.environ.get("LAZIO_PREFECT_VAST_ONBOX_LIMIT", "8") or "8")
-ONBOX_RESULTS_PATH = os.environ.get("PREFECT_LOCAL_STORAGE_PATH", "").strip()
-ONBOX_FLOWS_DIR = os.environ.get("LAZIO_ONBOX_FLOWS_DIR", "/opt/prefect/flows")
-
 
 def check_health() -> bool:
     """Return True if VLLM_HEALTH_URL answers HTTP 200 right now."""
@@ -296,13 +286,8 @@ def read_activity() -> tuple[float | None, float]:
     return running + waiting, running
 
 
-# The destroy path is the money-safety backstop and MUST NOT depend on the
-# on-box networking extras. On-box worker mode (issue #1249) exports
-# ALL_PROXY/HTTP_PROXY/HTTPS_PROXY pointing at the unsupervised userspace
-# tailscaled so the Prefect client can reach hermes; if urllib honoured those,
-# a dead tailscaled would route the console.vast.ai destroy call into a black
-# hole and the box would burn forever. This opener has an empty ProxyHandler, so
-# every vast API call goes direct regardless of the proxy env vars.
+# The destroy path is the money-safety backstop and ignores inherited proxy
+# settings. Every Vast API call goes direct.
 _VAST_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -414,105 +399,11 @@ class VllmSupervisor:
                 LOG.warning("terminating vLLM failed: %s", exc)
 
 
-class WorkerSupervisor:
-    """Owns the on-box Prefect worker subprocesses (issue #1249).
-
-    Unlike the vLLM child, a worker dying is NOT a money-safety event: the box is
-    still serving inference, so a dead worker is simply restarted and never
-    triggers a destroy. Workers start only after vLLM is healthy AND the shared
-    result mount is confirmed live, because a worker that ran backend_call
-    without the mount would persist results to the box's own disk where the
-    hermes-side parent that called run_deployment could never read them (silent
-    result loss)."""
-
-    def __init__(self) -> None:
-        self.procs: list[subprocess.Popen | None] = []
-        self._specs: list[tuple[str, str]] = []  # (pool, worker_name)
-
-    def _mount_live(self) -> bool:
-        if not ONBOX_RESULTS_PATH:
-            return False
-        try:
-            return os.path.ismount(ONBOX_RESULTS_PATH)
-        except OSError:
-            return False
-
-    def _spawn(self, pool: str, name: str) -> subprocess.Popen | None:
-        cmd = [
-            "prefect", "worker", "start",
-            "--pool", pool,
-            "--type", "process",
-            "--name", name,
-            "--limit", str(ONBOX_WORKER_LIMIT),
-        ]
-        LOG.info(
-            "starting on-box worker pool=%s name=%s limit=%s", pool, name, ONBOX_WORKER_LIMIT
-        )
-        try:
-            return subprocess.Popen(cmd, cwd=ONBOX_FLOWS_DIR)  # noqa: S603 - trusted argv
-        except Exception as exc:  # noqa: BLE001 - a spawn failure (e.g. prefect not
-            # on PATH, or the flows dir missing) must NEVER kill the watchdog; that
-            # would drop vLLM destroy supervision and risk a burning box. Log and
-            # treat it as a dead worker: check_and_restart retries next tick.
-            LOG.error("failed to spawn on-box worker %s (pool=%s): %s", name, pool, exc)
-            return None
-
-    def start(self) -> bool:
-        """Start the configured workers. Starts nothing and returns False if
-        on-box mode is off/misconfigured or the result mount is not live."""
-        if not (ONBOX_ENABLED and ONBOX_WORKER_COUNT > 0 and ONBOX_POOLS):
-            LOG.info("on-box worker mode not armed; running vLLM-only")
-            return False
-        if not self._mount_live():
-            LOG.error(
-                "on-box mode is on but the shared result mount %s is NOT live; "
-                "refusing to start workers (their results would be unreadable by "
-                "hermes). Box keeps serving vLLM on its public URL.",
-                ONBOX_RESULTS_PATH or "<unset>",
-            )
-            return False
-        cid = os.environ.get("CONTAINER_ID", "box")
-        for i in range(ONBOX_WORKER_COUNT):
-            pool = ONBOX_POOLS[i % len(ONBOX_POOLS)]
-            name = f"vast-{cid}-{pool}-{i}"
-            self._specs.append((pool, name))
-            self.procs.append(self._spawn(pool, name))
-        LOG.info("started %s on-box worker(s) across pools %s", len(self.procs), ONBOX_POOLS)
-        return True
-
-    def check_and_restart(self) -> None:
-        """Restart any worker that exited or failed to spawn. Never destroys the
-        box and never propagates (a restart failure is logged and retried next
-        tick)."""
-        for idx, proc in enumerate(self.procs):
-            if proc is not None and proc.poll() is None:
-                continue
-            pool, name = self._specs[idx]
-            if proc is not None:
-                LOG.warning(
-                    "on-box worker %s (pool=%s) exited rc=%s; restarting",
-                    name, pool, proc.returncode,
-                )
-            self.procs[idx] = self._spawn(pool, name)
-
-    def terminate(self) -> None:
-        for proc in self.procs:
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.terminate()
-                except Exception as exc:  # noqa: BLE001 - best-effort shutdown
-                    LOG.warning("terminating on-box worker failed: %s", exc)
-
-
-def destroy_and_exit(
-    sup: VllmSupervisor, reason: str, workers: WorkerSupervisor | None = None
-) -> None:
+def destroy_and_exit(sup: VllmSupervisor, reason: str) -> None:
     """Tear the vLLM child down, destroy this instance (retrying until it dies),
     then exit. If self-destruct is disabled, exit anyway after logging loudly;
-    exiting does not stop the box (not PID 1), so the hermes-side compute
+    exiting does not stop the box (not PID 1), so the production compute
     steward is the remaining backstop in that mode."""
-    if workers is not None:
-        workers.terminate()
     sup.terminate()
     while not request_destroy(reason):
         instance_id = _get_instance_id()
@@ -588,8 +479,6 @@ def main() -> None:
             "box that never serves is pure waste",
         )
 
-    workers = None
-
     now = time.time()
     boot_time = now
     last_activity_time = now
@@ -604,7 +493,7 @@ def main() -> None:
         state = sup.check()
         if state == "dead":
             destroy_and_exit(
-                sup, "vLLM died after health and exhausted its restart budget", workers
+                sup, "vLLM died after health and exhausted its restart budget"
             )
         if state == "restarted":
             # A restart re-enters warmup; reset the idle clock so we do not
@@ -635,12 +524,12 @@ def main() -> None:
 
         if idle_minutes >= IDLE_MINUTES:
             destroy_and_exit(
-                sup, f"idle for {idle_minutes:.1f} minutes (limit {IDLE_MINUTES})", workers
+                sup, f"idle for {idle_minutes:.1f} minutes (limit {IDLE_MINUTES})"
             )
 
         if uptime_hours >= TTL_HOURS:
             destroy_and_exit(
-                sup, f"TTL reached: {uptime_hours:.1f} hours alive (limit {TTL_HOURS})", workers
+                sup, f"TTL reached: {uptime_hours:.1f} hours alive (limit {TTL_HOURS})"
             )
 
 
