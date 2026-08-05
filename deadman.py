@@ -383,7 +383,9 @@ class VllmSupervisor:
         self.restarts_used = 0
 
     def start(self) -> None:
-        LOG.info("starting vLLM: %s", " ".join(self.cmd))
+        # The command includes the vLLM bearer as an argv value. Never copy the
+        # full command into logs or incident transcripts.
+        LOG.info("starting vLLM")
         self.proc = subprocess.Popen(self.cmd)  # noqa: S603 - trusted argv from entrypoint
 
     def check(self) -> str:
