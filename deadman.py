@@ -20,14 +20,6 @@ kill the watchdog before it could destroy the instance. Supervising vLLM as a
 child process
 fixes that.
 
-On-box worker mode (issue #1249): when LAZIO_VAST_ONBOX=1, after vLLM is healthy
-this process also supervises WORKER_COUNT Prefect process workers so the rented
-box drains its own queue instead of hermes's 8 vCPUs starving the GPU. A worker
-dying is NOT a money-safety event (the box is still serving inference), so a
-dead worker is restarted and never triggers a destroy; only vLLM death destroys.
-Workers start only if the shared Prefect result mount is live, so a half-set-up
-box never persists results the hermes-side caller cannot read.
-
 Standard library only (subprocess, urllib, os, sys, time, json, logging) so this
 file has no extra pip install and cannot be broken by a dependency drifting
 under it.
@@ -224,12 +216,9 @@ def _get_instance_id() -> str | None:
         _RESOLVED_INSTANCE_ID = _resolve_instance_id()
     return _RESOLVED_INSTANCE_ID
 
-# On-box worker mode (issue #1249): when LAZIO_VAST_ONBOX=1 this box also runs
-# Prefect process workers, started AFTER vLLM is healthy and ONLY if the shared
-# result mount is live. A worker dying is not a money-safety event (the box is
-# still serving inference), so workers are restarted and never trigger a destroy;
-# only vLLM death destroys. Env is injected by routes/llm_backends._burst_onbox_env.
-ONBOX_ENABLED = os.environ.get("LAZIO_VAST_ONBOX", "0").strip() == "1"
+# Rented GPU boxes are inference-only. These constants remain only so old
+# watchdog code cannot be accidentally re-enabled by a stale environment.
+ONBOX_ENABLED = False
 ONBOX_WORKER_COUNT = int(os.environ.get("WORKER_COUNT", "0") or "0")
 ONBOX_POOLS = [p for p in os.environ.get("LAZIO_PREFECT_ONBOX_POOLS", "").split() if p]
 ONBOX_WORKER_LIMIT = int(os.environ.get("LAZIO_PREFECT_VAST_ONBOX_LIMIT", "8") or "8")
@@ -597,11 +586,7 @@ def main() -> None:
             "box that never serves is pure waste",
         )
 
-    # On-box workers start only now that vLLM is healthy. A failure to start (or
-    # a dead result mount) leaves the box serving vLLM on its public URL; it is
-    # never a destroy condition.
-    workers = WorkerSupervisor()
-    workers.start()
+    workers = None
 
     now = time.time()
     boot_time = now
@@ -625,10 +610,6 @@ def main() -> None:
             last_activity_time = time.time()
             last_activity_value = None
             continue
-
-        # 2) Keep the on-box workers alive. Worker death is not a money-safety
-        #    event, so restart them without ever destroying the box.
-        workers.check_and_restart()
 
         now = time.time()
         try:
