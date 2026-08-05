@@ -32,11 +32,15 @@ Standard library only (subprocess, urllib, os, sys, time, json, logging) so this
 file has no extra pip install and cannot be broken by a dependency drifting
 under it.
 
-If VAST_INSTANCE_ID or VAST_DESTROY_KEY is missing, self-destruct is disabled
-but the watchdog still runs and logs exactly what it WOULD have done. NOTE:
-because this process is not container PID 1, exiting does NOT stop the box or
-its billing; with self-destruct disabled the only backstops are the hermes-side
-compute steward (never-healthy / TTL / unproductive destroys) and the operator.
+If VAST_INSTANCE_ID is missing, non-numeric, or VAST_DESTROY_KEY is missing,
+self-destruct is disabled but the watchdog still runs and logs exactly what it
+WOULD have done. VAST_INSTANCE_ID must be the numeric vast contract id; if the
+provision env passes a non-numeric value (e.g. $CONTAINER_ID, issue #3712), the
+watchdog attempts to discover the numeric id from the vast API at startup and
+logs CRITICAL if it cannot. NOTE: because this process is not container PID 1,
+exiting does NOT stop the box or its billing; with self-destruct disabled the
+only backstops are the hermes-side compute steward (never-healthy / TTL /
+unproductive destroys) and the operator.
 """
 
 from __future__ import annotations
@@ -57,12 +61,13 @@ _handler.setFormatter(logging.Formatter("deadman: %(message)s"))
 LOG.addHandler(_handler)
 LOG.propagate = False
 
-# vast.ai injects the instance id as CONTAINER_ID inside every rented box, so
-# the provision env can set VAST_INSTANCE_ID=$CONTAINER_ID (resolved on the
-# box). Fall back to CONTAINER_ID directly if VAST_INSTANCE_ID did not resolve.
-VAST_INSTANCE_ID = (
-    os.environ.get("VAST_INSTANCE_ID", "").strip() or os.environ.get("CONTAINER_ID", "").strip()
-)
+# The provision env used to set VAST_INSTANCE_ID=$CONTAINER_ID, but
+# CONTAINER_ID is a docker/container identifier, NOT the numeric vast contract
+# id the destroy API requires (issue #3712). The watchdog now validates its id
+# at startup and, if the env var is missing or non-numeric, resolves it by
+# asking the vast API which instance this box is.
+VAST_INSTANCE_ID_RAW = os.environ.get("VAST_INSTANCE_ID", "").strip()
+CONTAINER_ID = os.environ.get("CONTAINER_ID", "").strip()
 VAST_DESTROY_KEY = os.environ.get("VAST_DESTROY_KEY", "").strip()
 IDLE_MINUTES = float(os.environ.get("IDLE_MINUTES", "10"))
 TTL_HOURS = float(os.environ.get("TTL_HOURS", "6"))
@@ -78,7 +83,146 @@ HTTP_TIMEOUT_SECONDS = 5
 DESTROY_MAX_ATTEMPTS = 5
 DESTROY_INITIAL_BACKOFF_SECONDS = 5
 
-DESTROY_ENABLED = bool(VAST_INSTANCE_ID and VAST_DESTROY_KEY)
+# Populated lazily by _get_instance_id(). The raw env var is no longer trusted
+# to be the numeric contract id.
+_RESOLVED_INSTANCE_ID: str | None = None
+
+
+def _is_numeric_instance_id(value: str) -> bool:
+    """The vast API destroy path accepts only the bare numeric contract id."""
+    return bool(value) and value.isdigit()
+
+
+def _my_public_ip(timeout: float = 5.0) -> str | None:
+    """Best-effort public IPv4 of this box. Used to identify ourselves in the
+    vast fleet list when CONTAINER_ID is not exposed by the API.
+
+    Uses a no-proxy opener so on-box worker mode's tailscaled proxy cannot
+    return the proxy's IP instead of this box's public IP.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for url in (
+        "https://api.ipify.org",
+        "https://checkip.amazonaws.com",
+        "https://ifconfig.me/ip",
+    ):
+        try:
+            req = urllib.request.Request(url, method="GET")  # noqa: S310
+            with opener.open(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8", errors="replace").strip()
+                if text:
+                    return text
+        except Exception:  # noqa: BLE001 - best-effort metadata fetch
+            continue
+    return None
+
+
+def _discover_instance_id() -> str | None:
+    """Ask the vast API which instance this box is.
+
+    We have the account key (VAST_DESTROY_KEY) but the env did not give us a
+    numeric contract id. Identify ourselves by CONTAINER_ID if the API exposes
+    it, otherwise by public IP address.
+    """
+    if not VAST_DESTROY_KEY:
+        LOG.critical(
+            "VAST_DESTROY_KEY is not set; cannot discover our instance id "
+            "from the vast API"
+        )
+        return None
+
+    try:
+        req = urllib.request.Request(
+            "https://console.vast.ai/api/v0/instances/",
+            method="GET",
+            headers={"Authorization": f"Bearer {VAST_DESTROY_KEY}"},
+        )
+        with _VAST_API_OPENER.open(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as exc:  # noqa: BLE001
+        LOG.critical(
+            "could not list vast instances to discover our instance id: %s", exc
+        )
+        return None
+
+    instances = payload.get("instances") or []
+    if not isinstance(instances, list):
+        LOG.critical(
+            "vast instances list returned unexpected shape: %r", type(payload)
+        )
+        return None
+
+    # Strategy 1: match by the docker/container id vast injected as CONTAINER_ID.
+    if CONTAINER_ID:
+        for inst in instances:
+            if not isinstance(inst, dict):
+                continue
+            if str(inst.get("container_id") or "").strip() == CONTAINER_ID:
+                candidate = str(inst.get("id") or "").strip()
+                if _is_numeric_instance_id(candidate):
+                    return candidate
+
+    # Strategy 2: match by public IP. This needs outbound network, but the box
+    # already needed outbound network to pull weights.
+    my_ip = _my_public_ip()
+    if my_ip:
+        for inst in instances:
+            if not isinstance(inst, dict):
+                continue
+            if str(inst.get("public_ipaddr") or "").strip() == my_ip:
+                candidate = str(inst.get("id") or "").strip()
+                if _is_numeric_instance_id(candidate):
+                    return candidate
+
+    LOG.critical(
+        "could not identify this box in the vast fleet list "
+        "(tried CONTAINER_ID=%r, public_ip=%r)",
+        CONTAINER_ID or "<unset>",
+        my_ip or "<unresolved>",
+    )
+    return None
+
+
+def _resolve_instance_id() -> str | None:
+    """Return the numeric vast contract id for this box, or None.
+
+    A kill path that silently cannot fire is worse than no kill path, so any
+    mismatch is logged at CRITICAL.
+    """
+    if _is_numeric_instance_id(VAST_INSTANCE_ID_RAW):
+        return VAST_INSTANCE_ID_RAW
+
+    if VAST_INSTANCE_ID_RAW:
+        LOG.critical(
+            "VAST_INSTANCE_ID=%r is not a numeric vast instance id; "
+            "attempting to discover the correct id from the vast API",
+            VAST_INSTANCE_ID_RAW,
+        )
+    else:
+        LOG.info(
+            "VAST_INSTANCE_ID is not set; attempting to discover the correct "
+            "instance id from the vast API"
+        )
+
+    discovered = _discover_instance_id()
+    if _is_numeric_instance_id(discovered):
+        LOG.info("discovered vast instance id: %s", discovered)
+        return discovered
+
+    LOG.critical(
+        "could not resolve a numeric vast instance id for this box. "
+        "Self-destruct is disabled; the compute steward remains the only "
+        "automatic backstop."
+    )
+    return None
+
+
+def _get_instance_id() -> str | None:
+    """Lazily resolve and cache the numeric instance id."""
+    global _RESOLVED_INSTANCE_ID
+    if _RESOLVED_INSTANCE_ID is None:
+        _RESOLVED_INSTANCE_ID = _resolve_instance_id()
+    return _RESOLVED_INSTANCE_ID
 
 # On-box worker mode (issue #1249): when LAZIO_VAST_ONBOX=1 this box also runs
 # Prefect process workers, started AFTER vLLM is healthy and ONLY if the shared
@@ -173,9 +317,9 @@ def read_activity() -> tuple[float | None, float]:
 _VAST_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def destroy_once() -> bool:
+def destroy_once(instance_id: str) -> bool:
     """Call the vast.ai destroy API once. Returns True on a 2xx response."""
-    url = f"https://console.vast.ai/api/v0/instances/{VAST_INSTANCE_ID}/"
+    url = f"https://console.vast.ai/api/v0/instances/{instance_id}/"
     req = urllib.request.Request(
         url,
         data=json.dumps({}).encode("utf-8"),
@@ -213,10 +357,11 @@ def request_destroy(reason: str) -> bool:
     """
     LOG.warning("destroy triggered: %s", reason)
 
-    if not DESTROY_ENABLED:
+    instance_id = _get_instance_id()
+    if not instance_id or not VAST_DESTROY_KEY:
         LOG.warning(
-            "self-destruct is DISABLED (VAST_INSTANCE_ID and/or VAST_DESTROY_KEY "
-            "not set); this is what I WOULD have destroyed for, continuing to "
+            "self-destruct is DISABLED (numeric VAST_INSTANCE_ID and/or VAST_DESTROY_KEY "
+            "not available); this is what I WOULD have destroyed for, continuing to "
             "monitor only"
         )
         return False
@@ -224,7 +369,7 @@ def request_destroy(reason: str) -> bool:
     backoff = DESTROY_INITIAL_BACKOFF_SECONDS
     for attempt in range(1, DESTROY_MAX_ATTEMPTS + 1):
         LOG.warning("destroy attempt %s/%s", attempt, DESTROY_MAX_ATTEMPTS)
-        if destroy_once():
+        if destroy_once(instance_id):
             LOG.warning("instance destroyed successfully, exiting")
             return True
         if attempt < DESTROY_MAX_ATTEMPTS:
@@ -379,7 +524,8 @@ def destroy_and_exit(
         workers.terminate()
     sup.terminate()
     while not request_destroy(reason):
-        if not DESTROY_ENABLED:
+        instance_id = _get_instance_id()
+        if not instance_id or not VAST_DESTROY_KEY:
             LOG.error(
                 "self-destruct is DISABLED; exiting. NOTE this does not stop "
                 "the box (not PID 1); the compute steward must reap it"
@@ -424,12 +570,22 @@ def main() -> None:
         "watchdog armed, supervising vLLM, entering boot grace window (%s minutes)",
         BOOT_GRACE_MINUTES,
     )
-    if not DESTROY_ENABLED:
+    # Resolve the numeric instance id NOW, before we need it in an emergency.
+    # A kill path that silently cannot fire is worse than no kill path.
+    resolved_id = _get_instance_id()
+    if not resolved_id:
         LOG.warning(
-            "VAST_INSTANCE_ID and/or VAST_DESTROY_KEY are not set at startup; "
+            "numeric VAST_INSTANCE_ID could not be resolved at startup; "
             "self-destruct is DISABLED for this run, watchdog will only log "
             "what it would do"
         )
+    elif not VAST_DESTROY_KEY:
+        LOG.warning(
+            "VAST_DESTROY_KEY is not set at startup; self-destruct is DISABLED "
+            "for this run, watchdog will only log what it would do"
+        )
+    else:
+        LOG.info("self-destruct armed for instance %s", resolved_id)
 
     sup = VllmSupervisor(vllm_cmd)
     sup.start()
