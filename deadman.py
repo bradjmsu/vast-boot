@@ -306,6 +306,21 @@ def requests_stalled(*, running: float, seconds_since_progress: float) -> bool:
     return running > 0 and seconds_since_progress >= STALL_MINUTES * 60
 
 
+def update_stall_started_at(
+    current: float | None,
+    *,
+    running: float,
+    progressed: bool,
+    now: float,
+) -> float | None:
+    """Track when the current no-progress running interval began."""
+    if running <= 0:
+        return None
+    if progressed or current is None:
+        return now
+    return current
+
+
 # The destroy path is the money-safety backstop and ignores inherited proxy
 # settings. Every Vast API call goes direct.
 _VAST_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -522,6 +537,7 @@ def main() -> None:
     boot_time = now
     last_activity_time = now
     last_activity_value: float | None = None
+    stall_started_at: float | None = None
     LOG.info("idle clock and TTL clock armed at first successful health check")
 
     while True:
@@ -539,6 +555,7 @@ def main() -> None:
             # idle-kill during the reload, and skip the activity read this tick.
             last_activity_time = time.time()
             last_activity_value = None
+            stall_started_at = None
             continue
 
         now = time.time()
@@ -548,22 +565,34 @@ def main() -> None:
             LOG.error("unexpected error reading activity, skipping this poll: %s", exc)
             continue
 
+        progressed = False
         if activity_value is not None:
-            if last_activity_value is not None and activity_value > last_activity_value:
+            if last_activity_value is None or activity_value > last_activity_value:
                 last_activity_time = now
+                progressed = True
                 LOG.info("activity seen, idle clock reset")
             last_activity_value = activity_value
+
+        stall_started_at = update_stall_started_at(
+            stall_started_at,
+            running=running,
+            progressed=progressed,
+            now=now,
+        )
 
         idle_minutes = (now - last_activity_time) / 60.0
         uptime_hours = (now - boot_time) / 3600.0
 
         if requests_stalled(
             running=running,
-            seconds_since_progress=now - last_activity_time,
+            seconds_since_progress=(
+                now - stall_started_at if stall_started_at is not None else 0.0
+            ),
         ):
+            stall_minutes = (now - stall_started_at) / 60.0
             reason = (
                 f"{int(running)} running requests made no token progress for "
-                f"{idle_minutes:.1f} minutes"
+                f"{stall_minutes:.1f} minutes"
             )
             LOG.error("inference stall detected: %s", reason)
             if not sup.restart_stalled() or not wait_for_boot_health(sup):
@@ -573,6 +602,7 @@ def main() -> None:
                 )
             last_activity_time = time.time()
             last_activity_value = None
+            stall_started_at = None
             LOG.info("stalled vLLM recovered; useful-activity clock reset")
             continue
 
