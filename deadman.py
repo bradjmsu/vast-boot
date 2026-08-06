@@ -10,6 +10,8 @@ true:
 
   - vLLM dies unexpectedly and cannot be restarted (crash/OOM after health would
     otherwise leave a stopped-but-billing box); one restart is attempted first
+  - accepted requests make no prompt or generation token progress; one forced
+    restart is attempted first, then a repeated stall destroys the rental
   - the server never becomes healthy within a boot grace window (pure waste)
   - the server has been idle (no new inference activity) past IDLE_MINUTES
   - the instance has been alive past TTL_HOURS, regardless of activity, as a
