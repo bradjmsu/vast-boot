@@ -61,6 +61,7 @@ VAST_INSTANCE_ID_RAW = os.environ.get("VAST_INSTANCE_ID", "").strip()
 CONTAINER_ID = os.environ.get("CONTAINER_ID", "").strip()
 VAST_DESTROY_KEY = os.environ.get("VAST_DESTROY_KEY", "").strip()
 IDLE_MINUTES = float(os.environ.get("IDLE_MINUTES", "10"))
+STALL_MINUTES = float(os.environ.get("STALL_MINUTES", "5"))
 TTL_HOURS = float(os.environ.get("TTL_HOURS", "6"))
 BOOT_GRACE_MINUTES = float(os.environ.get("BOOT_GRACE_MINUTES", "15"))
 VLLM_HEALTH_URL = os.environ.get("VLLM_HEALTH_URL", "http://127.0.0.1:8000/health")
@@ -261,11 +262,12 @@ def parse_prometheus_text(text: str) -> dict[str, float]:
 def read_activity() -> tuple[float | None, float]:
     """Read vLLM metrics and return (activity_counter, currently_running).
 
-    activity_counter prefers vllm:request_success_total, falls back to
-    vllm:generation_tokens_total, and finally falls back to a level proxy of
-    running plus waiting requests when neither counter is exposed. Returns
-    (None, 0.0) on any read/parse failure so a transient scrape error never
-    trips a false idle/destroy decision.
+    activity_counter prefers the sum of prompt and generation tokens because
+    either can move during one long request before request_success_total does.
+    It falls back to completed requests, then to a level proxy of running plus
+    waiting requests when no monotonic counter is exposed. Returns (None, 0.0)
+    on any read/parse failure so a transient scrape error never trips a false
+    idle/destroy decision.
     """
     try:
         req = urllib.request.Request(VLLM_METRICS_URL, method="GET")
@@ -279,11 +281,27 @@ def read_activity() -> tuple[float | None, float]:
     running = metrics.get("vllm:num_requests_running", 0.0)
     waiting = metrics.get("vllm:num_requests_waiting", 0.0)
 
+    token_counters = [
+        metrics[name]
+        for name in ("vllm:prompt_tokens_total", "vllm:generation_tokens_total")
+        if name in metrics
+    ]
+    if token_counters:
+        return sum(token_counters), running
     if "vllm:request_success_total" in metrics:
         return metrics["vllm:request_success_total"], running
-    if "vllm:generation_tokens_total" in metrics:
-        return metrics["vllm:generation_tokens_total"], running
     return running + waiting, running
+
+
+def requests_stalled(*, running: float, seconds_since_progress: float) -> bool:
+    """Return True when accepted requests have made no token progress.
+
+    HTTP 200 health and num_requests_running only prove that vLLM accepted the
+    requests. They do not prove useful inference. A wedged H100 held 32 running
+    requests for hours with fixed token counters, so running must never reset
+    the useful-activity clock by itself.
+    """
+    return running > 0 and seconds_since_progress >= STALL_MINUTES * 60
 
 
 # The destroy path is the money-safety backstop and ignores inherited proxy
@@ -395,8 +413,27 @@ class VllmSupervisor:
             try:
                 self.proc.terminate()
                 self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                LOG.warning("vLLM ignored SIGTERM for 10s; force killing it")
+                self.proc.kill()
+                self.proc.wait(timeout=10)
             except Exception as exc:  # noqa: BLE001 - best-effort shutdown
                 LOG.warning("terminating vLLM failed: %s", exc)
+
+    def restart_stalled(self) -> bool:
+        """Spend one restart attempt on a live process making no progress."""
+        if self.restarts_used >= RESTART_ATTEMPTS:
+            LOG.error("vLLM exhausted its restart budget (%s)", RESTART_ATTEMPTS)
+            return False
+        self.restarts_used += 1
+        LOG.warning(
+            "restarting stalled vLLM (attempt %s/%s)",
+            self.restarts_used,
+            RESTART_ATTEMPTS,
+        )
+        self.terminate()
+        self.start()
+        return True
 
 
 def destroy_and_exit(sup: VllmSupervisor, reason: str) -> None:
@@ -515,14 +552,29 @@ def main() -> None:
                 LOG.info("activity seen, idle clock reset")
             last_activity_value = activity_value
 
-        if running and running > 0:
-            last_activity_time = now
-            LOG.info("activity seen, idle clock reset")
-
         idle_minutes = (now - last_activity_time) / 60.0
         uptime_hours = (now - boot_time) / 3600.0
 
-        if idle_minutes >= IDLE_MINUTES:
+        if requests_stalled(
+            running=running,
+            seconds_since_progress=now - last_activity_time,
+        ):
+            reason = (
+                f"{int(running)} running requests made no token progress for "
+                f"{idle_minutes:.1f} minutes"
+            )
+            LOG.error("inference stall detected: %s", reason)
+            if not sup.restart_stalled() or not wait_for_boot_health(sup):
+                destroy_and_exit(
+                    sup,
+                    f"{reason}; restart failed or restart budget exhausted",
+                )
+            last_activity_time = time.time()
+            last_activity_value = None
+            LOG.info("stalled vLLM recovered; useful-activity clock reset")
+            continue
+
+        if running <= 0 and idle_minutes >= IDLE_MINUTES:
             destroy_and_exit(
                 sup, f"idle for {idle_minutes:.1f} minutes (limit {IDLE_MINUTES})"
             )

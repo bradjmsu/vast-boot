@@ -4,8 +4,9 @@ This directory is the canonical source for the scripts that boot a Vast burst
 GPU serving `Qwen/Qwen3.6-35B-A3B-FP8` through vLLM.
 
 - `onstart.sh` downloads the model and starts vLLM under the watchdog.
-- `deadman.py` supervises vLLM and destroys the rental after boot failure,
-  sustained idle time, a terminal vLLM failure, or the hard TTL.
+- `deadman.py` supervises vLLM, restarts one inference stall, and destroys the
+  rental after a repeated stall, boot failure, sustained idle time, terminal
+  vLLM failure, or the hard TTL.
 - `known-good.json` publishes the exact image digest and model revisions.
 
 The rented box is an inference endpoint only. It does not run Prefect workers,
