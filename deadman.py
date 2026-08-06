@@ -321,6 +321,26 @@ def update_stall_started_at(
     return current
 
 
+def select_watchdog_action(
+    *,
+    running: float,
+    seconds_since_progress: float,
+    idle_minutes: float,
+    uptime_hours: float,
+) -> str | None:
+    """Select the next safety action with hard TTL first."""
+    if uptime_hours >= TTL_HOURS:
+        return "ttl"
+    if requests_stalled(
+        running=running,
+        seconds_since_progress=seconds_since_progress,
+    ):
+        return "stall"
+    if running <= 0 and idle_minutes >= IDLE_MINUTES:
+        return "idle"
+    return None
+
+
 # The destroy path is the money-safety backstop and ignores inherited proxy
 # settings. Every Vast API call goes direct.
 _VAST_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -402,11 +422,17 @@ class VllmSupervisor:
         self.proc: subprocess.Popen | None = None
         self.restarts_used = 0
 
-    def start(self) -> None:
+    def start(self) -> bool:
         # The command includes the vLLM bearer as an argv value. Never copy the
         # full command into logs or incident transcripts.
         LOG.info("starting vLLM")
-        self.proc = subprocess.Popen(self.cmd)  # noqa: S603 - trusted argv from entrypoint
+        try:
+            self.proc = subprocess.Popen(self.cmd)  # noqa: S603 - trusted argv from entrypoint
+            return True
+        except Exception as exc:  # noqa: BLE001 - watchdog must reach destroy
+            self.proc = None
+            LOG.error("starting vLLM failed: %s", exc)
+            return False
 
     def check(self) -> str:
         """One liveness check: 'alive', 'restarted' (was dead, respawned), or
@@ -420,22 +446,27 @@ class VllmSupervisor:
         if self.restarts_used < RESTART_ATTEMPTS:
             self.restarts_used += 1
             LOG.warning("restarting vLLM (attempt %s/%s)", self.restarts_used, RESTART_ATTEMPTS)
-            self.start()
-            return "restarted"
+            return "restarted" if self.start() else "dead"
         LOG.error("vLLM exhausted its restart budget (%s)", RESTART_ATTEMPTS)
         return "dead"
 
-    def terminate(self) -> None:
+    def terminate(self) -> bool:
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.terminate()
                 self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 LOG.warning("vLLM ignored SIGTERM for 10s; force killing it")
-                self.proc.kill()
-                self.proc.wait(timeout=10)
+                try:
+                    self.proc.kill()
+                    self.proc.wait(timeout=10)
+                except Exception as exc:  # noqa: BLE001 - watchdog must reach destroy
+                    LOG.error("force killing vLLM failed: %s", exc)
+                    return False
             except Exception as exc:  # noqa: BLE001 - best-effort shutdown
                 LOG.warning("terminating vLLM failed: %s", exc)
+                return False
+        return True
 
     def restart_stalled(self) -> bool:
         """Spend one restart attempt on a live process making no progress."""
@@ -448,9 +479,9 @@ class VllmSupervisor:
             self.restarts_used,
             RESTART_ATTEMPTS,
         )
-        self.terminate()
-        self.start()
-        return True
+        if not self.terminate():
+            return False
+        return self.start()
 
 
 def destroy_and_exit(sup: VllmSupervisor, reason: str) -> None:
@@ -524,7 +555,8 @@ def main() -> None:
         LOG.info("self-destruct armed for instance %s", resolved_id)
 
     sup = VllmSupervisor(vllm_cmd)
-    sup.start()
+    if not sup.start():
+        destroy_and_exit(sup, "vLLM could not start; a box that cannot serve is pure waste")
 
     if not wait_for_boot_health(sup):
         destroy_and_exit(
@@ -582,13 +614,22 @@ def main() -> None:
 
         idle_minutes = (now - last_activity_time) / 60.0
         uptime_hours = (now - boot_time) / 3600.0
-
-        if requests_stalled(
+        seconds_since_progress = (
+            now - stall_started_at if stall_started_at is not None else 0.0
+        )
+        action = select_watchdog_action(
             running=running,
-            seconds_since_progress=(
-                now - stall_started_at if stall_started_at is not None else 0.0
-            ),
-        ):
+            seconds_since_progress=seconds_since_progress,
+            idle_minutes=idle_minutes,
+            uptime_hours=uptime_hours,
+        )
+
+        if action == "ttl":
+            destroy_and_exit(
+                sup, f"TTL reached: {uptime_hours:.1f} hours alive (limit {TTL_HOURS})"
+            )
+
+        if action == "stall":
             stall_minutes = (now - stall_started_at) / 60.0
             reason = (
                 f"{int(running)} running requests made no token progress for "
@@ -606,14 +647,9 @@ def main() -> None:
             LOG.info("stalled vLLM recovered; useful-activity clock reset")
             continue
 
-        if running <= 0 and idle_minutes >= IDLE_MINUTES:
+        if action == "idle":
             destroy_and_exit(
                 sup, f"idle for {idle_minutes:.1f} minutes (limit {IDLE_MINUTES})"
-            )
-
-        if uptime_hours >= TTL_HOURS:
-            destroy_and_exit(
-                sup, f"TTL reached: {uptime_hours:.1f} hours alive (limit {TTL_HOURS})"
             )
 
 
