@@ -12,9 +12,10 @@ if [[ -z "${VLLM_API_KEY:-}" ]]; then
     exit 1
 fi
 
-export HF_HUB_ENABLE_HF_TRANSFER=1
-python3 -c 'import hf_transfer' 2>/dev/null || \
-    pip install --no-cache-dir --break-system-packages hf_transfer
+# The Xet CDN path repeatedly lost TLS connections on a live RTX PRO 6000
+# rental and wrote only 65 MB in 15 minutes. Regular HTTP sustained more than
+# 100 MB/s on the same host. Avoid Xet so cold start is fast and predictable.
+export HF_HUB_DISABLE_XET=1
 
 MODEL_REPO="${VLLM_HF_MODEL:-Qwen/Qwen3.6-35B-A3B-FP8}"
 MODEL_REVISION="${VLLM_HF_REVISION:?VLLM_HF_REVISION is required}"
